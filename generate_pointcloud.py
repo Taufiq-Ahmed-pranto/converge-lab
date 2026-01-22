@@ -95,11 +95,9 @@ def depth_to_point_cloud(depth_map, rgb_image, intrinsics, extrinsics, conf_map=
     return points_world, colors
 
 
-def merge_point_clouds(prediction, conf_thresh=0.5):
-    """Combine all frames into single point cloud"""
-    all_points = []
-    all_colors = []
-    
+def create_point_cloud_per_frame(prediction, conf_thresh=0.5):
+    """Create separate point clouds for each frame"""
+    point_clouds = []
     n_frames = len(prediction.depth)
     
     for i in range(n_frames):
@@ -111,58 +109,254 @@ def merge_point_clouds(prediction, conf_thresh=0.5):
             prediction.conf[i],
             conf_thresh
         )
+        
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+        point_clouds.append(pcd)
+        
+    return point_clouds
+
+
+def refine_alignment_icp(point_clouds, voxel_size=0.02, max_correspondence_distance=0.05):
+    """
+    Refine alignment between point clouds using ICP (Iterative Closest Point).
+    This corrects small misalignments from estimated camera poses.
+    """
+    if len(point_clouds) < 2:
+        return point_clouds
+    
+    print(f"\nRefining alignment with ICP (voxel_size={voxel_size})...")
+    
+    refined_pcds = [point_clouds[0]]  # First cloud is reference
+    
+    for i in range(1, len(point_clouds)):
+        source = point_clouds[i]
+        target = refined_pcds[-1]  # Align to previous cloud
+        
+        # Downsample for faster ICP
+        source_down = source.voxel_down_sample(voxel_size)
+        target_down = target.voxel_down_sample(voxel_size)
+        
+        # Estimate normals for point-to-plane ICP
+        source_down.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size*2, max_nn=30))
+        target_down.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size*2, max_nn=30))
+        
+        # Run ICP
+        result = o3d.pipelines.registration.registration_icp(
+            source_down, target_down,
+            max_correspondence_distance,
+            np.eye(4),
+            o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50)
+        )
+        
+        # Apply transformation to original (non-downsampled) point cloud
+        source_refined = source.transform(result.transformation)
+        refined_pcds.append(source_refined)
+        
+        print(f"  Frame {i}: fitness={result.fitness:.4f}, RMSE={result.inlier_rmse:.6f}")
+    
+    return refined_pcds
+
+
+def refine_alignment_multiway(point_clouds, voxel_size=0.01):
+    """
+    Global multiway registration for better alignment of all point clouds.
+    Uses pose graph optimization for global consistency.
+    """
+    if len(point_clouds) < 2:
+        return point_clouds
+    
+    print(f"\nPerforming multiway registration (voxel_size={voxel_size})...")
+    
+    # Downsample all point clouds
+    pcds_down = []
+    for pcd in point_clouds:
+        pcd_down = pcd.voxel_down_sample(voxel_size)
+        pcd_down.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size*2, max_nn=30))
+        pcds_down.append(pcd_down)
+    
+    # Build pose graph
+    pose_graph = o3d.pipelines.registration.PoseGraph()
+    odometry = np.eye(4)
+    pose_graph.nodes.append(o3d.pipelines.registration.PoseGraphNode(odometry))
+    
+    n_pcds = len(pcds_down)
+    max_correspondence_distance = voxel_size * 1.5
+    
+    for source_id in range(n_pcds):
+        for target_id in range(source_id + 1, min(source_id + 3, n_pcds)):  # Connect nearby frames
+            # Pairwise registration
+            result = o3d.pipelines.registration.registration_icp(
+                pcds_down[source_id], pcds_down[target_id],
+                max_correspondence_distance,
+                np.eye(4),
+                o3d.pipelines.registration.TransformationEstimationPointToPlane()
+            )
+            
+            if target_id == source_id + 1:  # Odometry edge
+                odometry = result.transformation @ odometry
+                pose_graph.nodes.append(o3d.pipelines.registration.PoseGraphNode(np.linalg.inv(odometry)))
+            
+            # Add edge to pose graph
+            information = o3d.pipelines.registration.get_information_matrix_from_point_clouds(
+                pcds_down[source_id], pcds_down[target_id],
+                max_correspondence_distance,
+                result.transformation
+            )
+            
+            uncertain = target_id != source_id + 1
+            pose_graph.edges.append(
+                o3d.pipelines.registration.PoseGraphEdge(
+                    source_id, target_id, result.transformation, information, uncertain
+                )
+            )
+    
+    # Optimize pose graph
+    print("  Optimizing pose graph...")
+    option = o3d.pipelines.registration.GlobalOptimizationOption(
+        max_correspondence_distance=max_correspondence_distance,
+        edge_prune_threshold=0.25,
+        reference_node=0
+    )
+    o3d.pipelines.registration.global_optimization(
+        pose_graph,
+        o3d.pipelines.registration.GlobalOptimizationLevenbergMarquardt(),
+        o3d.pipelines.registration.GlobalOptimizationConvergenceCriteria(),
+        option
+    )
+    
+    # Apply optimized transformations
+    refined_pcds = []
+    for i, pcd in enumerate(point_clouds):
+        pcd_transformed = pcd.transform(pose_graph.nodes[i].pose)
+        refined_pcds.append(pcd_transformed)
+    
+    print("  Multiway registration complete.")
+    return refined_pcds
+
+
+def merge_point_clouds_simple(point_clouds):
+    """Simple merge by concatenating all point clouds"""
+    merged = o3d.geometry.PointCloud()
+    for pcd in point_clouds:
+        merged += pcd
+    return merged
+
+
+def voxel_downsample_and_denoise(pcd, voxel_size=0.01):
+    """
+    Voxel downsampling averages points within each voxel,
+    which reduces noise and creates more uniform point density.
+    """
+    print(f"Voxel downsampling with size {voxel_size}...")
+    pcd_down = pcd.voxel_down_sample(voxel_size)
+    print(f"  Points: {len(pcd.points)} → {len(pcd_down.points)}")
+    return pcd_down
+
+
+def statistical_outlier_removal(pcd, nb_neighbors=20, std_ratio=2.0):
+    """Remove statistical outliers"""
+    print(f"Removing outliers (neighbors={nb_neighbors}, std_ratio={std_ratio})...")
+    cl, ind = pcd.remove_statistical_outlier(nb_neighbors=nb_neighbors, std_ratio=std_ratio)
+    pcd_clean = pcd.select_by_index(ind)
+    print(f"  Points: {len(pcd.points)} → {len(pcd_clean.points)} (removed {len(pcd.points) - len(pcd_clean.points)})")
+    return pcd_clean
+
+
+def radius_outlier_removal(pcd, nb_points=16, radius=0.05):
+    """Remove points with few neighbors in radius"""
+    print(f"Radius outlier removal (points={nb_points}, radius={radius})...")
+    cl, ind = pcd.remove_radius_outlier(nb_points=nb_points, radius=radius)
+    pcd_clean = pcd.select_by_index(ind)
+    print(f"  Points: {len(pcd.points)} → {len(pcd_clean.points)}")
+    return pcd_clean
+
+
+def filter_by_multiview_consistency(point_clouds, distance_threshold=0.03, min_views=2):
+    """
+    Keep only points that are observed from multiple views.
+    Points seen from multiple cameras are more reliable.
+    """
+    print(f"\nFiltering by multi-view consistency (min_views={min_views})...")
+    
+    if len(point_clouds) < 2:
+        return merge_point_clouds_simple(point_clouds)
+    
+    # Merge all points with view indices
+    all_points = []
+    all_colors = []
+    view_indices = []
+    
+    for i, pcd in enumerate(point_clouds):
+        points = np.asarray(pcd.points)
+        colors = np.asarray(pcd.colors)
         all_points.append(points)
         all_colors.append(colors)
+        view_indices.extend([i] * len(points))
     
-    merged_points = np.vstack(all_points)
-    merged_colors = np.vstack(all_colors)
+    all_points = np.vstack(all_points)
+    all_colors = np.vstack(all_colors)
+    view_indices = np.array(view_indices)
     
-    print(f"Merged point cloud: {len(merged_points)} points")
-    return merged_points, merged_colors
-
-
-def clean_point_cloud_open3d(points_3d, colors_3d, nb_neighbors=20, std_ratio=2.0):
-    """Cleans a point cloud using Statistical Outlier Removal (SOR) via Open3D."""
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points_3d)
+    # Build KD-tree for finding nearby points
+    pcd_merged = o3d.geometry.PointCloud()
+    pcd_merged.points = o3d.utility.Vector3dVector(all_points)
+    kdtree = o3d.geometry.KDTreeFlann(pcd_merged)
     
-    if colors_3d.max() > 1.0:
-        pcd.colors = o3d.utility.Vector3dVector(colors_3d / 255.0)
-    else:
-        pcd.colors = o3d.utility.Vector3dVector(colors_3d)
-
-    cl, ind = pcd.remove_statistical_outlier(nb_neighbors=nb_neighbors, std_ratio=std_ratio)
-    inlier_mask = np.asarray(ind)
+    # For each point, count how many different views have nearby points
+    consistent_mask = np.zeros(len(all_points), dtype=bool)
     
-    cleaned_points = points_3d[inlier_mask]
-    cleaned_colors = colors_3d[inlier_mask]
+    for i in range(len(all_points)):
+        [k, idx, _] = kdtree.search_radius_vector_3d(all_points[i], distance_threshold)
+        if k > 0:
+            nearby_views = set(view_indices[idx])
+            if len(nearby_views) >= min_views:
+                consistent_mask[i] = True
+    
+    # Filter points
+    consistent_points = all_points[consistent_mask]
+    consistent_colors = all_colors[consistent_mask]
+    
+    print(f"  Kept {len(consistent_points)} / {len(all_points)} points ({100*len(consistent_points)/len(all_points):.1f}%)")
+    
+    pcd_consistent = o3d.geometry.PointCloud()
+    pcd_consistent.points = o3d.utility.Vector3dVector(consistent_points)
+    pcd_consistent.colors = o3d.utility.Vector3dVector(consistent_colors)
+    
+    return pcd_consistent
 
-    return cleaned_points, cleaned_colors
 
-
-def export_point_cloud_ply(points, colors, filepath):
-    """Export point cloud to PLY format"""
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
-    pcd.colors = o3d.utility.Vector3dVector(colors)
+def export_point_cloud_ply_o3d(pcd, filepath):
+    """Export Open3D point cloud to PLY format"""
     o3d.io.write_point_cloud(filepath, pcd)
     print(f"Point cloud exported to {filepath}")
 
 
-def visualize_point_cloud_open3d(points, colors=None, window_name="Point Cloud"):
-    """Display 3D point cloud with Open3D viewer"""
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
-    
-    if colors is not None:
-        pcd.colors = o3d.utility.Vector3dVector(colors)
-    
+def visualize_point_cloud_o3d(pcd, window_name="Point Cloud"):
+    """Display Open3D point cloud"""
     o3d.visualization.draw_geometries([pcd], window_name=window_name)
 
 
-def process_pipeline(data_folder, conf_thresh=0.4, visualize=True, clean=True):
-    """Main pipeline to generate cleaned point cloud from images"""
+def process_pipeline(data_folder, conf_thresh=0.4, visualize=True, clean=True, 
+                     use_icp=False, use_multiway=False, use_multiview_filter=False,
+                     voxel_size=0.0):
+    """
+    Main pipeline to generate point cloud from images.
+    
+    Args:
+        data_folder: Name of folder in DATA directory
+        conf_thresh: Confidence threshold for depth filtering
+        visualize: Show interactive visualization
+        clean: Apply statistical outlier removal
+        use_icp: Use ICP for pairwise alignment refinement
+        use_multiway: Use multiway registration for global alignment
+        use_multiview_filter: Keep only points seen from multiple views
+        voxel_size: Voxel size for downsampling (0 = no downsampling, keeps all points)
+    """
     print(f"Starting pipeline for dataset: {data_folder}")
+    print("="*60)
     
     # Setup paths
     paths = setup_paths(data_folder)
@@ -175,48 +369,106 @@ def process_pipeline(data_folder, conf_thresh=0.4, visualize=True, clean=True):
         return
         
     # Load model
-    print("Loading model...")
+    print("\nLoading model...")
     model, device = load_da3_model()
     print("Model loaded.")
     
     # Run inference
-    print("Running inference...")
+    print("\nRunning inference...")
     prediction = run_da3_inference(model, image_files)
     
-    # Generate point cloud
-    print(f"Generating point cloud with confidence threshold: {conf_thresh}")
-    points_3d, colors_3d = merge_point_clouds(prediction, conf_thresh=conf_thresh)
+    # Create per-frame point clouds
+    print(f"\nGenerating point clouds with confidence threshold: {conf_thresh}")
+    point_clouds = create_point_cloud_per_frame(prediction, conf_thresh=conf_thresh)
+    print(f"Created {len(point_clouds)} point clouds")
     
-    # Clean point cloud (optional)
-    if clean:
-        print("Cleaning point cloud...")
-        clean_pts, clean_cols = clean_point_cloud_open3d(points_3d, colors_3d)
-        print(f"Cleaned point cloud: {len(clean_pts)} points (removed {len(points_3d) - len(clean_pts)} outliers)")
-        final_pts, final_cols = clean_pts, clean_cols
+    # === ALIGNMENT REFINEMENT ===
+    # Note: ICP/multiway uses internal downsampling for speed, but applies
+    # the computed transformations to the FULL point clouds
+    if use_multiway:
+        # Multiway registration (best for global consistency)
+        # Use a reasonable voxel size for registration computation only
+        registration_voxel_size = 0.02 if voxel_size <= 0 else voxel_size * 2
+        point_clouds = refine_alignment_multiway(point_clouds, voxel_size=registration_voxel_size)
+    elif use_icp:
+        # Pairwise ICP refinement
+        registration_voxel_size = 0.02 if voxel_size <= 0 else voxel_size * 2
+        point_clouds = refine_alignment_icp(point_clouds, voxel_size=registration_voxel_size)
+    
+    # === MERGE POINT CLOUDS ===
+    if use_multiview_filter:
+        # Keep only points seen from multiple views
+        distance_thresh = 0.03 if voxel_size <= 0 else voxel_size * 3
+        merged_pcd = filter_by_multiview_consistency(point_clouds, 
+                                                      distance_threshold=distance_thresh,
+                                                      min_views=2)
     else:
-        print("Skipping point cloud cleaning.")
-        final_pts, final_cols = points_3d, colors_3d
+        # Simple merge
+        merged_pcd = merge_point_clouds_simple(point_clouds)
     
-    # Visualize point cloud
+    print(f"\nMerged point cloud: {len(merged_pcd.points)} points")
+    
+    # === POST-PROCESSING ===
+    # Voxel downsampling (only if voxel_size > 0)
+    if voxel_size > 0:
+        merged_pcd = voxel_downsample_and_denoise(merged_pcd, voxel_size=voxel_size)
+    else:
+        print("Skipping voxel downsampling (keeping all points)")
+    
+    # Statistical outlier removal
+    if clean:
+        merged_pcd = statistical_outlier_removal(merged_pcd, nb_neighbors=20, std_ratio=2.0)
+    
+    # Get final points and colors
+    final_pts = np.asarray(merged_pcd.points)
+    final_cols = np.asarray(merged_pcd.colors)
+    
+    print(f"\nFinal point cloud: {len(final_pts)} points")
+    
+    # Visualize
     if visualize:
-        print("Visualizing point cloud...")
-        visualize_point_cloud_open3d(final_pts, final_cols, window_name="Point Cloud")
+        print("\nVisualizing point cloud...")
+        visualize_point_cloud_o3d(merged_pcd, window_name="Point Cloud")
     
     # Export result
     ply_path = os.path.join(paths['results'], "scene_pointcloud.ply")
-    export_point_cloud_ply(final_pts, final_cols, ply_path)
+    export_point_cloud_ply_o3d(merged_pcd, ply_path)
     
+    print("\n" + "="*60)
     print("Pipeline completed successfully!")
+    print("="*60)
+    
     return final_pts, final_cols
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate 3D point cloud from images using Depth Anything 3")
-    parser.add_argument("--data_folder", type=str, default="SAMPLE_SCENE", help="Name of the folder in DATA directory")
-    parser.add_argument("--conf_thresh", type=float, default=0.4, help="Confidence threshold for filtering points")
-    parser.add_argument("--no_visualize", action="store_true", help="Disable visualization")
-    parser.add_argument("--no_clean", action="store_true", help="Disable point cloud cleaning (outlier removal)")
+    parser.add_argument("--data_folder", type=str, default="SAMPLE_SCENE", 
+                        help="Name of the folder in DATA directory")
+    parser.add_argument("--conf_thresh", type=float, default=0.4, 
+                        help="Confidence threshold for filtering points (0.0-1.0)")
+    parser.add_argument("--voxel_size", type=float, default=0.0, 
+                        help="Voxel size for downsampling (0 = no downsampling, keeps all points)")
+    parser.add_argument("--no_visualize", action="store_true", 
+                        help="Disable visualization")
+    parser.add_argument("--no_clean", action="store_true", 
+                        help="Disable point cloud cleaning (outlier removal)")
+    parser.add_argument("--icp", action="store_true", 
+                        help="Use ICP for pairwise alignment refinement")
+    parser.add_argument("--multiway", action="store_true", 
+                        help="Use multiway registration for global alignment (recommended)")
+    parser.add_argument("--multiview", action="store_true", 
+                        help="Filter to keep only points seen from multiple views")
     
     args = parser.parse_args()
     
-    process_pipeline(args.data_folder, args.conf_thresh, visualize=not args.no_visualize, clean=not args.no_clean)
+    process_pipeline(
+        args.data_folder, 
+        args.conf_thresh, 
+        visualize=not args.no_visualize, 
+        clean=not args.no_clean,
+        use_icp=args.icp,
+        use_multiway=args.multiway,
+        use_multiview_filter=args.multiview,
+        voxel_size=args.voxel_size
+    )
