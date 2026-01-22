@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.env
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# Large files and outputs
+*.ply
+*.npz
+*.pt
+*.pth
+*.ckpt
+output/
+RESULTS/
+
+# Images in DATA (keep structure, exclude large files)
+# DATA/
+
+# Model weights (downloaded automatically)
+*.bin
+*.safetensors
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Depth-Anything-3 submodule/clone (it's a separate repo)
+Depth-Anything-3/
