@@ -20,7 +20,7 @@ def setup_paths(data_folder="SAMPLE_SCENE", base_path=None):
     return paths
 
 
-def load_da3_model(model_name="depth-anything/DA3-GIANT-1.1"):
+def load_da3_model(model_name="depth-anything/DA3NESTED-GIANT-LARGE-1.1"):
     """Initialize Depth-Anything-3 model on available device"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -383,33 +383,25 @@ def process_pipeline(data_folder, conf_thresh=0.4, visualize=True, clean=True,
     print(f"Created {len(point_clouds)} point clouds")
     
     # === ALIGNMENT REFINEMENT ===
-    # Note: ICP/multiway uses internal downsampling for speed, but applies
-    # the computed transformations to the FULL point clouds
     if use_multiway:
-        # Multiway registration (best for global consistency)
-        # Use a reasonable voxel size for registration computation only
         registration_voxel_size = 0.02 if voxel_size <= 0 else voxel_size * 2
         point_clouds = refine_alignment_multiway(point_clouds, voxel_size=registration_voxel_size)
     elif use_icp:
-        # Pairwise ICP refinement
         registration_voxel_size = 0.02 if voxel_size <= 0 else voxel_size * 2
         point_clouds = refine_alignment_icp(point_clouds, voxel_size=registration_voxel_size)
     
     # === MERGE POINT CLOUDS ===
     if use_multiview_filter:
-        # Keep only points seen from multiple views
         distance_thresh = 0.03 if voxel_size <= 0 else voxel_size * 3
         merged_pcd = filter_by_multiview_consistency(point_clouds, 
                                                       distance_threshold=distance_thresh,
                                                       min_views=2)
     else:
-        # Simple merge
         merged_pcd = merge_point_clouds_simple(point_clouds)
     
     print(f"\nMerged point cloud: {len(merged_pcd.points)} points")
     
     # === POST-PROCESSING ===
-    # Voxel downsampling (only if voxel_size > 0)
     if voxel_size > 0:
         merged_pcd = voxel_downsample_and_denoise(merged_pcd, voxel_size=voxel_size)
     else:
@@ -417,7 +409,8 @@ def process_pipeline(data_folder, conf_thresh=0.4, visualize=True, clean=True,
     
     # Statistical outlier removal
     if clean:
-        merged_pcd = statistical_outlier_removal(merged_pcd, nb_neighbors=20, std_ratio=2.0)
+        merged_pcd = radius_outlier_removal(merged_pcd, nb_points=6, radius=0.25)
+        #merged_pcd = statistical_outlier_removal(merged_pcd, nb_neighbors=20, std_ratio=2.0)
     
     # Get final points and colors
     final_pts = np.asarray(merged_pcd.points)
@@ -445,14 +438,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate 3D point cloud from images using Depth Anything 3")
     parser.add_argument("--data_folder", type=str, default="SAMPLE_SCENE", 
                         help="Name of the folder in DATA directory")
-    parser.add_argument("--conf_thresh", type=float, default=0.4, 
+    parser.add_argument("--conf_thresh", type=float, default=0.5, 
                         help="Confidence threshold for filtering points (0.0-1.0)")
     parser.add_argument("--voxel_size", type=float, default=0.0, 
                         help="Voxel size for downsampling (0 = no downsampling, keeps all points)")
     parser.add_argument("--no_visualize", action="store_true", 
                         help="Disable visualization")
     parser.add_argument("--no_clean", action="store_true", 
-                        help="Disable point cloud cleaning (outlier removal)")
+                        help="Disable statistical outlier removal")
     parser.add_argument("--icp", action="store_true", 
                         help="Use ICP for pairwise alignment refinement")
     parser.add_argument("--multiway", action="store_true", 
