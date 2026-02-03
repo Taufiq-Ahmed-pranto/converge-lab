@@ -75,8 +75,8 @@ cd Depth-Anything-3
 ### Step 4: Install Core Dependencies
 
 ```bash
-# Install PyTorch with CUDA support
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# Install PyTorch with CUDA support and xformers for speed
+pip install xformers torch torchvision --index-url https://download.pytorch.org/whl/cu121
 
 # Install Depth Anything 3 requirements
 pip install -r requirements.txt
@@ -84,10 +84,10 @@ pip install -r requirements.txt
 # Install Depth Anything 3 package
 pip install -e .
 
-# Install point cloud dependencies
-pip install open3d matplotlib scikit-learn
+# Install point cloud and computer vision dependencies
+pip install open3d matplotlib scikit-learn opencv-python
 
-# Install segmentation dependencies (for segmented pipeline)
+# Install segmentation dependencies (for Mask2Former)
 pip install transformers accelerate
 ```
 
@@ -98,15 +98,22 @@ python -c "
 import torch
 from depth_anything_3.api import DepthAnything3
 import open3d as o3d
-from transformers import Mask2FormerForUniversalSegmentation
+from transformers import AutoImageProcessor, Mask2FormerForUniversalSegmentation
 
 print('✅ PyTorch:', torch.__version__)
 print('✅ CUDA available:', torch.cuda.is_available())
 if torch.cuda.is_available():
     print('✅ GPU:', torch.cuda.get_device_name(0))
 print('✅ Open3D:', o3d.__version__)
+
+# Test model instantiation (lightweight check)
+try:
+    processor = AutoImageProcessor.from_pretrained('facebook/mask2former-swin-tiny-ade-semantic')
+    print('✅ Mask2Former (Transformers): OK')
+except Exception as e:
+    print('❌ Mask2Former Check Failed:', e)
+
 print('✅ Depth Anything 3: OK')
-print('✅ Transformers (Mask2Former): OK')
 "
 ```
 
@@ -156,15 +163,24 @@ python generate_pointcloud.py --data_folder your_folder_name --conf_thresh 0.5
 ### Option 2: Segmented Point Cloud (RGB + Labels)
 
 ```bash
-# With visualization
+# Basic run
 python generate_segmented_pointcloud.py --data_folder your_folder_name
 
-# Without visualization
-python generate_segmented_pointcloud.py --data_folder your_folder_name --no_visualize
+# RECOMMENDED: High-quality alignment (Global registration)
+python generate_segmented_pointcloud.py --data_folder your_folder_name --multiway
 
-# Custom confidence threshold
-python generate_segmented_pointcloud.py --data_folder your_folder_name --conf_thresh 0.5
+# MAXIMUM QUALITY: Multiway alignment + Noise filtering + Downsampling
+python generate_segmented_pointcloud.py --data_folder your_folder_name --multiway --multiview --voxel_size 0.02
 ```
+
+**Advanced Flags:**
+| Flag | Description | Recommendation |
+|------|-------------|----------------|
+| `--multiway` | Uses Pose Graph optimization for global alignment | **Highly Recommended** for multi-view |
+| `--icp` | Uses pairwise alignment refinement | Good for simple sequences |
+| `--multiview`| Keeps only points seen in multiple views | Removes floating noise artifacts |
+| `--voxel_size`| Grid size for downsampling (e.g., 0.02 = 2cm) | Speeds up viewer & cleans labels |
+| `--conf_thresh`| Depth confidence threshold (0.0-1.0) | Default 0.4 is usually stable |
 
 **Outputs:**
 | File | Description |
@@ -172,6 +188,17 @@ python generate_segmented_pointcloud.py --data_folder your_folder_name --conf_th
 | `scene_pointcloud_rgb.ply` | Point cloud with original RGB colors |
 | `scene_pointcloud_segmented.ply` | Point cloud colored by segment class |
 | `scene_pointcloud_labels.npz` | NumPy file with points, colors, and segment IDs |
+
+> 💡 **Note on First Run:** Models (~4GB) will be automatically downloaded from Hugging Face on the first execution. Ensure you have an active internet connection.
+
+---
+
+## 📐 Metric vs. Relative Depth
+
+By default, the pipeline uses **Relative Depth** (accurate geometry but arbitrary scale). For real-world measurements in meters:
+1. Ensure your dataset has sufficient movement.
+2. Edit `generate_segmented_pointcloud.py` to use `depth-anything/DA3NESTED-GIANT-LARGE-1.1`.
+3. The results in the `.npz` file and `.ply` will then be at metric scale.
 
 ---
 
