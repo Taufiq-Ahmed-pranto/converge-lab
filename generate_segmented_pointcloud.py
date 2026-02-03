@@ -70,7 +70,7 @@ def setup_paths(data_folder="SAMPLE_SCENE", base_path=None):
     return paths
 
 
-def load_da3_model(model_name="depth-anything/DA3NESTED-GIANT-LARGE-1.1"):
+def load_da3_model(model_name="depth-anything/DA3-GIANT-1.1"):
     """Initialize Depth-Anything-3 model on available device"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
