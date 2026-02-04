@@ -1,0 +1,28 @@
+import numpy as np
+import open3d as o3d
+
+# Load the labels file
+data = np.load(r"/home/sasan/Desktop/project/depth_anything/RESULTS/converge_six_picture/scene_pointcloud_labels.npz", allow_pickle=True)
+
+points = data['points']           # (N, 3) - XYZ coordinates
+colors = data['colors']           # (N, 3) - RGB values [0-1]
+segments = data['segments']       # (N,) - Class IDs (0-149)
+class_names = data['class_names'] # List of 150 class names
+
+# Example: Extract only "chair" points (class 19)
+chair_mask = segments == 42
+chair_points = points[chair_mask]
+chair_colors = colors[chair_mask]
+print(f"Found {len(chair_points)} points belonging to chairs")
+
+# Example: Get all unique classes in the scene
+unique_classes = np.unique(segments)
+for class_id in unique_classes:
+    count = np.sum(segments == class_id)
+    print(f"{class_names[class_id]}: {count} points")
+
+# Visualize specific class
+pcd = o3d.geometry.PointCloud()
+pcd.points = o3d.utility.Vector3dVector(chair_points)
+pcd.colors = o3d.utility.Vector3dVector(chair_colors)
+o3d.visualization.draw_geometries([pcd])

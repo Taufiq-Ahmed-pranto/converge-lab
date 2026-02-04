@@ -11,6 +11,8 @@ import numpy as np
 import open3d as o3d
 import argparse
 import gc
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 from PIL import Image
 from depth_anything_3.api import DepthAnything3
 from transformers import AutoImageProcessor, Mask2FormerForUniversalSegmentation
@@ -494,6 +496,43 @@ def voxel_downsample_with_segments(points, colors, segments, voxel_size=0.01):
     return new_points, new_colors, new_segments
 
 
+def save_segmentation_image(seg_map, filepath, image_name):
+    """Save segmentation map as a colored image"""
+    # Get colors for all segments
+    max_class_id = int(seg_map.max())
+    segment_colors = get_segment_colors(max_class_id + 1)
+    
+    # Create colored segmentation image
+    colored_seg = segment_colors[seg_map.astype(int)]
+    
+    # Convert to 8-bit RGB
+    colored_seg_uint8 = (colored_seg * 255).astype(np.uint8)
+    
+    # Save as PNG
+    seg_image = Image.fromarray(colored_seg_uint8)
+    seg_filepath = os.path.join(filepath, f"{image_name}_segmentation.png")
+    seg_image.save(seg_filepath)
+    print(f"Segmentation image saved: {seg_filepath}")
+
+
+def save_depth_image(depth_map, filepath, image_name):
+    """Save depth map as a colored image using colormap"""
+    # Normalize depth for visualization (0-1 range)
+    depth_normalized = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min() + 1e-8)
+    
+    # Apply colormap (viridis: purple=close, yellow=far)
+    colored_depth = cm.viridis(depth_normalized)
+    
+    # Convert to 8-bit RGB (remove alpha channel)
+    colored_depth_uint8 = (colored_depth[:, :, :3] * 255).astype(np.uint8)
+    
+    # Save as PNG
+    depth_image = Image.fromarray(colored_depth_uint8)
+    depth_filepath = os.path.join(filepath, f"{image_name}_depth.png")
+    depth_image.save(depth_filepath)
+    print(f"Depth image saved: {depth_filepath}")
+
+
 def export_segmented_point_cloud_ply(points, colors, segments, filepath):
     """Export point cloud with segment colors to PLY format"""
     segment_colors = get_segment_colors(int(segments.max()) + 1)
@@ -596,6 +635,10 @@ def process_pipeline_with_segmentation(data_folder, conf_thresh=0.4, visualize=T
     paths = setup_paths(data_folder)
     print(f"Output directory: {paths['results']}")
     
+    # Create masks subdirectory for intermediate results
+    masks_dir = os.path.join(paths['results'], 'masks')
+    os.makedirs(masks_dir, exist_ok=True)
+    
     # Find images
     image_files = load_images_from_folder(paths['data'])
     if not image_files:
@@ -614,6 +657,11 @@ def process_pipeline_with_segmentation(data_folder, conf_thresh=0.4, visualize=T
         print(f"  Segmenting image {i+1}/{len(image_files)}: {os.path.basename(img_path)}")
         seg_map = run_segmentation(seg_model, seg_processor, img_path, device)
         seg_maps.append(seg_map)
+        
+        # Save segmentation image
+        image_name = os.path.splitext(os.path.basename(img_path))[0]
+        save_segmentation_image(seg_map, masks_dir, f"image_{i:03d}_{image_name}")
+        
         torch.cuda.empty_cache()
     print("Segmentation complete.")
     
@@ -632,6 +680,12 @@ def process_pipeline_with_segmentation(data_folder, conf_thresh=0.4, visualize=T
     # Run depth inference
     print("\n[4/5] Running depth estimation...")
     prediction = run_da3_inference(da3_model, image_files)
+    
+    # Save depth images
+    print("Saving depth visualization images...")
+    for i, img_path in enumerate(image_files):
+        image_name = os.path.splitext(os.path.basename(img_path))[0]
+        save_depth_image(prediction.depth[i], masks_dir, f"image_{i:03d}_{image_name}")
     
     # Create per-frame point clouds with segments
     print(f"\n[5/5] Generating point clouds with confidence threshold: {conf_thresh}")
