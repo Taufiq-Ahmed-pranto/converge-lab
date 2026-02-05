@@ -1,0 +1,41 @@
+[project]
+name = "myproject"
+description = ""
+readme = "README.md"
+
+authors = [
+    { name = "Taufiq Ahmed", email = "taufiq.ahmed@oulu.fi" },
+    { name = "Daniel Herrera C.", email = "daniel.herreracastro@oulu.fi" },
+]
+maintainers = [
+    { name = "Taufiq Ahmed", email = "taufiq.ahmed@oulu.fi" },
+    { name = "Daniel Herrera C.", email = "daniel.herreracastro@oulu.fi" },
+]
+version = "2026.0.0"
+
+requires-python = "== 3.12.*"
+dependencies = [
+    "torch",
+    "torchvision",
+    "Depth-Anything-3 @ git+https://github.com/ByteDance-Seed/Depth-Anything-3",
+    "ninja",
+    "pybind11",
+    "gsplat",
+    "transformers",
+]
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu121"
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+torchvision = { index = "pytorch" }
+
+[build-system]
+requires = ["uv_build"]
+build-backend = "uv_build"
+
+# [tool.pyright]
+# include = ["src"]
+# exclude = ["**/node_modules", "**/__pycache__"]
